@@ -1,0 +1,170 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Capstone: a serverless notes API.
+  HTTP API (API Gateway) -> Lambda (Python) -> DynamoDB, with logs, least-privilege IAM,
+  and a CloudWatch alarm on Lambda errors.
+
+Parameters:
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional. Email to notify when the function errors (you must confirm the subscription email).
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  # ---------- Data ----------
+  NotesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+  # ---------- Identity: the role the function runs as ----------
+  NotesFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:          # trust policy: who may assume this role
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:                          # permission policy: least privilege, one table
+        - PolicyName: notes-table-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Scan]
+                Resource: !GetAtt NotesTable.Arn
+
+  # ---------- Compute ----------
+  NotesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7                 # the default is "never expire"
+
+  NotesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Architectures: [arm64]             # Graviton: cheaper per ms
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 10
+      Role: !GetAtt NotesFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref NotesLogGroup
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NotesTable
+      Code:
+        ZipFile: |
+          import base64, json, os, time, uuid
+          from decimal import Decimal
+          import boto3
+
+          # Runs once per execution environment (cold start), then reused
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+
+          def respond(status, body=None):
+              return {
+                  "statusCode": status,
+                  "headers": {"content-type": "application/json"},
+                  "body": "" if body is None else json.dumps(
+                      body, default=lambda o: int(o) if isinstance(o, Decimal) else str(o)),
+              }
+
+          def handler(event, context):
+              method = event.get("requestContext", {}).get("http", {}).get("method") or event.get("httpMethod")
+              path = (event.get("rawPath") or event.get("path") or "/").rstrip("/") or "/"
+              parts = path.strip("/").split("/")
+              print(json.dumps({"level": "INFO", "method": method, "path": path}))
+
+              if parts == ["boom"]:
+                  raise RuntimeError("intentional failure to trigger the alarm")
+              if parts[0] != "notes" or len(parts) > 2:
+                  return respond(404, {"error": "try GET/POST /notes or GET/DELETE /notes/{id}"})
+
+              if len(parts) == 1:
+                  if method == "GET":
+                      # Scan is fine for a demo table; see module 04 for why not at scale
+                      return respond(200, table.scan(Limit=100)["Items"])
+                  if method == "POST":
+                      raw = event.get("body") or "{}"
+                      if event.get("isBase64Encoded"):
+                          raw = base64.b64decode(raw).decode()
+                      text = json.loads(raw).get("text", "")
+                      item = {"id": uuid.uuid4().hex[:8], "text": text, "createdAt": int(time.time())}
+                      table.put_item(Item=item)
+                      return respond(201, item)
+              else:
+                  key = {"id": parts[1]}
+                  if method == "GET":
+                      item = table.get_item(Key=key).get("Item")
+                      return respond(200, item) if item else respond(404, {"error": "not found"})
+                  if method == "DELETE":
+                      table.delete_item(Key=key)
+                      return respond(204)
+              return respond(405, {"error": "method not allowed"})
+
+  # ---------- Front door ----------
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub ${AWS::StackName}-api
+      ProtocolType: HTTP
+      Target: !GetAtt NotesFunction.Arn  # "quick create": default route + stage -> this Lambda
+
+  ApiInvokePermission:                   # resource-based policy on the function
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref NotesFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+
+  # ---------- Observability ----------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlarmEmail
+    Properties:
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlarmEmail
+
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Notes function threw at least one error in a minute
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref NotesFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmEmail, [!Ref AlarmTopic], !Ref AWS::NoValue]
+
+Outputs:
+  ApiUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  TableName:
+    Value: !Ref NotesTable
+  FunctionName:
+    Value: !Ref NotesFunction
+  LogGroup:
+    Value: !Ref NotesLogGroup
