@@ -96,7 +96,7 @@
 aws sts get-caller-identity                                   # who am I?
 aws configure list                                            # which creds/region are active?
 aws ec2 describe-instances --query 'Reservations[].Instances[].[InstanceId,State.Name,PublicIpAddress]' --output table
-aws logs tail /aws/lambda/<fn> --follow                        # live Lambda logs
-aws cloudformation describe-stack-events --stack-name <s> --max-items 10   # why did my deploy fail?
-aws iam simulate-principal-policy --policy-source-arn <role-arn> --action-names s3:GetObject --resource-arns <arn>
+aws logs tail /aws/lambda/$FUNCTION_NAME --follow                        # live Lambda logs
+aws cloudformation describe-stack-events --stack-name $STACK_NAME --max-items 10   # why did my deploy fail?
+aws iam simulate-principal-policy --policy-source-arn $ROLE_ARN --action-names s3:GetObject --resource-arns $RESOURCE_ARN
 ```
